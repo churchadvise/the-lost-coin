@@ -1,7 +1,13 @@
 name: TestFlight
 
-# Builds The Lost Coin (Godot 4.7.2) for iOS on a cloud Mac, signs with the
-# App Store Connect API key (automatic signing), and uploads to TestFlight.
+# Builds The Lost Coin (Godot 4.7.2) for iOS on a cloud Mac, signs with a
+# manually installed distribution certificate + App Store provisioning
+# profile (both created via the ASC API), and uploads to TestFlight with
+# the App Store Connect API key. Manual signing is deliberate: run 40
+# (2026-11-20, TESTFLIGHT_NOTES §9) proved automatic signing cannot work
+# here — it made Xcode generate an iOS App DEVELOPMENT profile, which
+# requires a registered device on the team, and none is usable via
+# API-key auth.
 # The game project is NOT stored in this repo (Ark Pals pattern): each run
 # downloads the project tarball from the PROJECT_TARBALL_URL repo variable
 # (a link-shared Google Drive file, refreshed per build) and unpacks it
@@ -15,6 +21,11 @@ name: TestFlight
 #   ASC_API_ISSUER_ID     - ASC API issuer UUID
 #   ASC_API_KEY_P8_BASE64 - base64 of the .p8 private key file
 #   APPLE_TEAM_ID         - YZY5R75XTP
+#   DISTRIBUTION_CERT_P12_BASE64 - base64 of the password-protected .p12
+#     holding the CI distribution certificate + its private key
+#   DISTRIBUTION_CERT_PASSWORD   - that .p12's password
+#   APPSTORE_PROFILE_BASE64      - base64 of the "Lost Coin App Store CI"
+#     provisioning profile (.mobileprovision, UUID in PROFILE_UUID below)
 
 on:
   workflow_dispatch:
@@ -31,6 +42,12 @@ jobs:
       TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
       ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+      # The App Store provisioning profile created via the ASC API for
+      # manual signing (TESTFLIGHT_NOTES §9, run 40 fix). The install
+      # step below fails loudly if the profile decoded from
+      # APPSTORE_PROFILE_BASE64 carries any other UUID.
+      PROFILE_NAME: Lost Coin App Store CI
+      PROFILE_UUID: df1256ed-e5e6-4ec7-82d1-1036b70e4635
     steps:
       - name: Download the Lost Coin project tarball
         run: |
@@ -266,21 +283,85 @@ jobs:
           echo "$KEY_P8_BASE64" | base64 --decode > "$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
           echo "KEY_PATH=$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8" >> "$GITHUB_ENV"
 
-      - name: Archive (automatic signing via API key)
+      - name: Install distribution certificate and App Store profile (manual signing)
+        env:
+          CERT_P12_BASE64: ${{ secrets.DISTRIBUTION_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.DISTRIBUTION_CERT_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.APPSTORE_PROFILE_BASE64 }}
         run: |
           set -euo pipefail
+          # Run 40 fix (TESTFLIGHT_NOTES §9): manual distribution
+          # signing. The certificate (.p12) and the App Store profile
+          # were created via the ASC API and live only as repo secrets.
+          # Fail LOUDLY if any of them is missing — a silently unsigned
+          # or wrongly-profiled archive must never be produced.
+          for v in CERT_P12_BASE64 CERT_PASSWORD PROFILE_BASE64; do
+            if [ -z "${!v:-}" ]; then
+              echo "ERROR: required signing secret $v is empty or unset" >&2
+              exit 1
+            fi
+          done
+          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/distribution.p12"
+          echo "$PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+          # The decoded profile's own UUID must match the ASC API
+          # record this workflow was configured for — a stale or
+          # wrong secret fails here, before any archive is attempted.
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" -o "$RUNNER_TEMP/profile.plist"
+          PROFILE_UUID_FROM_FILE="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")"
+          echo "Profile in secret: $PROFILE_UUID_FROM_FILE (expected $PROFILE_UUID)"
+          if [ "$PROFILE_UUID_FROM_FILE" != "$PROFILE_UUID" ]; then
+            echo "ERROR: profile UUID $PROFILE_UUID_FROM_FILE does not match the ASC API record $PROFILE_UUID" >&2
+            exit 1
+          fi
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          # Temporary keychain holding ONLY the distribution identity.
+          KEYCHAIN_PATH="$RUNNER_TEMP/lostcoin-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/distribution.p12" -P "$CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # Prepend our keychain to the user search list (existing
+          # keychains kept) so codesign finds the identity.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" | tee "$RUNNER_TEMP/identities.txt"
+          grep -q "Apple Distribution" "$RUNNER_TEMP/identities.txt" || {
+            echo "ERROR: no Apple Distribution identity in the signing keychain" >&2
+            exit 1
+          }
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Archive (manual signing with the App Store profile)
+        run: |
+          set -euo pipefail
+          # Manual-signing overrides supersede the Godot project's
+          # baked-in Automatic / "Apple Development" pair at archive
+          # time. Step 8 (the Godot export) and its signing guard are
+          # deliberately untouched: export_project_only still disables
+          # Godot's internal archive, and distribution signing belongs
+          # to this step, as it always has in this workflow.
+          # -allowProvisioningUpdates is GONE: under manual signing
+          # there is nothing for Xcode to provision — the profile is
+          # already installed — and the flag is what sent run 40 down
+          # the development-profile generation path. The API-key auth
+          # flags stay: they authenticate this session (and the
+          # upload step's own auth is separate, in altool).
           xcodebuild archive \
             -project build/ios/thelostcoin.xcodeproj \
             -scheme thelostcoin \
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath "$PWD/build/TheLostCoin.xcarchive" \
-            -allowProvisioningUpdates \
             -authenticationKeyPath "$KEY_PATH" \
             -authenticationKeyID "$KEY_ID" \
             -authenticationKeyIssuerID "$ISSUER_ID" \
             DEVELOPMENT_TEAM="$TEAM_ID" \
-            CODE_SIGN_STYLE=Automatic
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME"
 
       - name: Write export options
         run: |
@@ -295,7 +376,7 @@ jobs:
             <key>teamID</key>
             <string>${TEAM_ID}</string>
             <key>signingStyle</key>
-            <string>automatic</string>
+            <string>manual</string>
             <key>manageAppVersionAndBuildNumber</key>
             <false/>
             <key>stripSwiftSymbols</key>
@@ -303,7 +384,7 @@ jobs:
             <key>provisioningProfiles</key>
             <dict>
               <key>com.eventideapps.lostcoin</key>
-              <string></string>
+              <string>${PROFILE_NAME}</string>
             </dict>
           </dict>
           </plist>
@@ -312,11 +393,14 @@ jobs:
       - name: Export the IPA
         run: |
           set -euo pipefail
+          # No -allowProvisioningUpdates here either: the export is
+          # manual-signing (see ExportOptions.plist above) against the
+          # already-installed App Store profile; the API-key flags
+          # remain for authentication only.
           xcodebuild -exportArchive \
             -archivePath "$PWD/build/TheLostCoin.xcarchive" \
             -exportPath "$PWD/build/ipa" \
             -exportOptionsPlist build/ExportOptions.plist \
-            -allowProvisioningUpdates \
             -authenticationKeyPath "$KEY_PATH" \
             -authenticationKeyID "$KEY_ID" \
             -authenticationKeyIssuerID "$ISSUER_ID"
