@@ -1,0 +1,341 @@
+name: TestFlight
+
+# Builds The Lost Coin (Godot 4.7.2) for iOS on a cloud Mac, signs with the
+# App Store Connect API key (automatic signing), and uploads to TestFlight.
+# The game project is NOT stored in this repo (Ark Pals pattern): each run
+# downloads the project tarball from the PROJECT_TARBALL_URL repo variable
+# (a link-shared Google Drive file, refreshed per build) and unpacks it
+# into the workspace root before building.
+# The InAppStore plugin (StoreKit) is built from pinned upstream source in a
+# dedicated step below — upstream ships no prebuilt binaries for Godot 4.x.
+# Required repo variable:
+#   PROJECT_TARBALL_URL   - direct-download link for the project tarball
+# Required repo secrets:
+#   ASC_API_KEY_ID        - e.g. MYMD552YY5
+#   ASC_API_ISSUER_ID     - ASC API issuer UUID
+#   ASC_API_KEY_P8_BASE64 - base64 of the .p8 private key file
+#   APPLE_TEAM_ID         - YZY5R75XTP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  testflight:
+    name: Build and upload to TestFlight
+    runs-on: macos-15
+    # 120 (not 60): a cache-miss run additionally builds the Godot headers
+    # for the InAppStore plugin from source, which is the long pole.
+    timeout-minutes: 120
+    env:
+      GODOT_VERSION: 4.7.2-stable
+      TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+      ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+    steps:
+      - name: Download the Lost Coin project tarball
+        run: |
+          set -euo pipefail
+          curl -fL -o project.tar.gz "${{ vars.PROJECT_TARBALL_URL }}"
+          tar -xzf project.tar.gz -C . --strip-components=1
+          rm project.tar.gz
+          # Fail loudly if the tarball layout is not the project this
+          # workflow expects (root-relative paths throughout below).
+          test -f project.godot
+          test -f export_presets.cfg
+          test -f scripts/flatten_icons.py
+          test -f ios/plugins/inappstore/inappstore.gdip
+          ls | head -30
+
+      # The InAppStore singleton (Apple StoreKit) comes from the official
+      # Godot iOS plugins. Upstream publishes NO prebuilt binaries for
+      # Godot 4.x (its GitHub releases stop at 3.5-stable, 2022), so the
+      # two xcframeworks are built here from pinned source and cached —
+      # the pins change ~never, so almost every run is a cache hit and
+      # skips the build entirely. The .gdip config itself is committed
+      # at ios/plugins/inappstore/inappstore.gdip (byte-identical to
+      # upstream at the pin); only the built binaries are uncommitted.
+      - name: Restore the built InAppStore plugin (cache)
+        id: plugin-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ios/plugins/inappstore/inappstore.release.xcframework
+            ios/plugins/inappstore/inappstore.debug.xcframework
+          # Bump the -vN suffix if the build recipe below changes.
+          # (v4: pre-flight audit fixes to the verification tail and the
+          # export step — see files/PREFLIGHT_AUDIT.md. Run 7 proved the
+          # v3 cache was never saved, so this bump costs no rebuild.)
+          key: inappstore-xcframeworks-caafb2c7-godot4.7.2-v4
+
+      - name: Build the InAppStore plugin from pinned source
+        if: steps.plugin-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # Pins — keep in sync with ios/plugins/inappstore/README.md.
+          PLUGINS_COMMIT=caafb2c7fbfb5c72a64f163c76449274fa49abaa
+          GODOT_TAG=4.7.2-stable
+          PLUGINS_DIR="$RUNNER_TEMP/godot-ios-plugins"
+          git clone https://github.com/godot-sdk-integrations/godot-ios-plugins.git "$PLUGINS_DIR"
+          git -C "$PLUGINS_DIR" checkout "$PLUGINS_COMMIT"
+          # Godot 4.7.2 renamed its scons targets (release_debug ->
+          # template_debug); upstream's generate_headers.sh at the pin
+          # still passes the old name to Godot's SConstruct, which
+          # rejects it ("Invalid value for enum variable 'target'").
+          # Patch the cloned script — CI config only, no game code.
+          # (The plugins repo's OWN SConstruct keeps its own
+          # release/release_debug target names; do not touch those.)
+          sed -i '' 's/target=release_debug/target=template_debug/' "$PLUGINS_DIR/scripts/generate_headers.sh"
+          grep 'target=' "$PLUGINS_DIR/scripts/generate_headers.sh"
+          # Run 2 root cause (2026-11-17, see TESTFLIGHT_NOTES §9):
+          # upstream's scripts/timeout is a watchdog that SIGTERMs
+          # whatever it wraps after 90 s — by design it kills the
+          # header-generation scons mid-build ("scons: Build
+          # interrupted.", exit 2, NO compiler error; run 2's kill
+          # landed 90.3 s after scons started, exactly the watchdog's
+          # sleep, after 358 clean compiles). The full template_debug
+          # build cannot finish in 90 s on this runner, so raise the
+          # watchdog to 2700 s: still a hang guard, no longer a build
+          # killer. Patch the cloned script — CI config only.
+          sed -i '' 's/sleep 90/sleep 2700/' "$PLUGINS_DIR/scripts/timeout"
+          grep 'sleep' "$PLUGINS_DIR/scripts/timeout"
+          # Cap the header/engine scons at -j2: the runner auto-detects
+          # 3 cores, and 3 parallel clang jobs over the engine's
+          # largest translation units are the peak-memory risk on the
+          # standard macos-15 runner. -j2 trades wall-clock for a
+          # roughly one-third lower peak; the headers produced (the
+          # only output this step exists for) are identical.
+          sed -i '' 's|scons platform=ios target=template_debug|scons platform=ios target=template_debug -j2|' "$PLUGINS_DIR/scripts/generate_headers.sh"
+          grep 'scons platform=ios' "$PLUGINS_DIR/scripts/generate_headers.sh"
+          # The plugins repo expects a Godot source tree in its godot/
+          # directory (an uninitialized submodule slot in a plain clone);
+          # supply the exact engine tag whose templates build this app.
+          git clone --depth 1 --branch "$GODOT_TAG" https://github.com/godotengine/godot.git "$PLUGINS_DIR/godot"
+          python3 -m venv "$RUNNER_TEMP/scons-venv"
+          "$RUNNER_TEMP/scons-venv/bin/pip" install -q scons
+          export PATH="$RUNNER_TEMP/scons-venv/bin:$PATH"
+          cd "$PLUGINS_DIR"
+          # Generates the Godot headers the plugin compiles against
+          # (upstream script: scons platform=ios target=release_debug,
+          # patched above to 4.7.2's target=template_debug, capped at
+          # -j2, with its 90 s timeout watchdog raised to 2700 s).
+          ./scripts/generate_headers.sh
+          # Upstream note: Godot's "debug" template is built with the
+          # release_debug target, so the pair is release + release_debug;
+          # Godot expects the latter renamed to .debug. on disk.
+          ./scripts/generate_xcframework.sh inappstore release 4.0
+          ./scripts/generate_xcframework.sh inappstore release_debug 4.0
+          DEST="$GITHUB_WORKSPACE/ios/plugins/inappstore"
+          cp -R bin/inappstore.release.xcframework "$DEST/"
+          cp -R bin/inappstore.release_debug.xcframework "$DEST/inappstore.debug.xcframework"
+          # Verify against the layout upstream's generate_xcframework.sh
+          # ACTUALLY produces (pre-flight audit 2026-11-18,
+          # files/PREFLIGHT_AUDIT.md): the script feeds
+          # xcodebuild -create-xcframework two libraries —
+          # bin/libinappstore.arm64-ios.<target>.a (device) and the
+          # lipo-merged bin/libinappstore-simulator.<target>.a — and
+          # xcodebuild keeps those basenames as the slices' LibraryPaths
+          # under ios-arm64/ and ios-arm64_x86_64-simulator/. Run 7
+          # failed silently here because the old guards expected a plain
+          # libinappstore.a — the name the hand-made LOCAL stand-ins
+          # use, not the real build's output. Print the full layout
+          # BEFORE the guards so any future drift shows in the log
+          # instead of failing without a trace.
+          echo "Built xcframework layout under $DEST:"
+          find "$DEST" -type f | sort
+          test -f "$DEST/inappstore.release.xcframework/Info.plist"
+          test -f "$DEST/inappstore.release.xcframework/ios-arm64/libinappstore.arm64-ios.release.a"
+          test -f "$DEST/inappstore.release.xcframework/ios-arm64_x86_64-simulator/libinappstore-simulator.release.a"
+          test -f "$DEST/inappstore.debug.xcframework/Info.plist"
+          test -f "$DEST/inappstore.debug.xcframework/ios-arm64/libinappstore.arm64-ios.release_debug.a"
+          test -f "$DEST/inappstore.debug.xcframework/ios-arm64_x86_64-simulator/libinappstore-simulator.release_debug.a"
+          ls -la "$DEST"
+
+      - name: Compute build number
+        run: echo "BUILD_NUMBER=$(( GITHUB_RUN_NUMBER + 100 ))" >> "$GITHUB_ENV"
+
+      - name: Download Godot and export templates
+        run: |
+          set -euo pipefail
+          curl -fL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_macos.universal.zip"
+          unzip -q godot.zip
+          curl -fL -o templates.tpz "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_export_templates.tpz"
+          TEMPLATES_DIR="$HOME/Library/Application Support/Godot/export_templates/4.7.2.stable"
+          mkdir -p "$TEMPLATES_DIR"
+          unzip -q templates.tpz -d /tmp/tpz
+          cp -R /tmp/tpz/templates/. "$TEMPLATES_DIR/"
+          ls "$TEMPLATES_DIR" | head
+
+      - name: Set build number in export preset
+        run: |
+          set -euo pipefail
+          sed -i '' -E 's|application/version="[0-9]+"|application/version="'"$BUILD_NUMBER"'"|' export_presets.cfg
+          grep 'application/version' export_presets.cfg
+
+      - name: Export the Xcode project with Godot
+        run: |
+          set -euo pipefail
+          GODOT="$PWD/Godot.app/Contents/MacOS/Godot"
+          mkdir -p build/ios
+          "$GODOT" --headless --import --path .
+          "$GODOT" --headless --export-release "iOS" --path .
+          test -d build/ios/thelostcoin.xcodeproj
+          test -f build/ios/thelostcoin/thelostcoin-Info.plist
+          # Fail loudly if the InAppStore plugin ever drops out of the
+          # export — a build without it has no store on device and must
+          # never reach TestFlight as if it were the real thing.
+          grep -q "inappstore.xcframework" build/ios/thelostcoin.xcodeproj/project.pbxproj
+          grep -q "StoreKit.framework" build/ios/thelostcoin.xcodeproj/project.pbxproj
+          grep -q "register_inappstore_types" build/ios/thelostcoin/dummy.cpp
+          # And the library that rode into the project must be a REAL
+          # built archive, not an empty stand-in: the local wiring
+          # checks use 8-byte placeholder .a files, and a build that
+          # somehow shipped one would pass every grep above while
+          # having no store on device. The real device .a is built
+          # from the plugin's objects and is far larger than 10 KB.
+          test -n "$(find build/ios/thelostcoin/dylibs -name '*.a' -size +10k -print -quit)"
+          # Run 24 (2026-11-19, see TESTFLIGHT_NOTES §9): the generated
+          # project paired CODE_SIGN_STYLE=Automatic with a manually
+          # specified "Apple Distribution" identity — Godot's default
+          # when the preset carries no application/code_sign_identity_
+          # release — and Xcode rejects that pair as conflicting
+          # provisioning settings. The preset now pins the release
+          # identity to "Apple Development" (distribution signing
+          # belongs to the archive/export steps below) and sets
+          # application/export_project_only=true so Godot's own
+          # internal archive — which runs with no API-key auth and
+          # whose .xcarchive/.ipa this workflow has never used — is
+          # skipped entirely. Dump the generated signing settings and
+          # fail LOUDLY here if the conflicting pair ever reappears,
+          # instead of dying inside an archive step.
+          echo "Generated project signing settings:"
+          grep -n "CODE_SIGN" build/ios/thelostcoin.xcodeproj/project.pbxproj
+          if grep -A1 'CODE_SIGN_IDENTITY = "Apple Distribution";' build/ios/thelostcoin.xcodeproj/project.pbxproj | grep -q 'CODE_SIGN_STYLE = "Automatic";'; then
+            echo "ERROR: generated project pairs Automatic signing with the Apple Distribution identity (run 24 conflict)" >&2
+            exit 1
+          fi
+          # export_project_only must have skipped Godot's internal
+          # archive — its .xcarchive is never used (the Archive step
+          # below makes its own, with the API key).
+          test ! -e build/ios/thelostcoin.xcarchive
+
+      - name: Flatten app icons (App Store rejects alpha)
+        run: |
+          set -euo pipefail
+          # Run 27 (2026-11-19, see TESTFLIGHT_NOTES §9): this step died
+          # in ~1 s — `python3 -m pip install --user pillow` is refused
+          # by the macos-15 runner's Homebrew-managed Python with
+          # PEP 668 "externally-managed-environment", so
+          # flatten_icons.py never ran. Pillow is now resolved in
+          # layers, and the step FAILS LOUDLY if no layer yields an
+          # importable PIL — an unflattened (alpha) icon set must
+          # never ride into the archive silently:
+          #   1. system python3 already imports PIL -> use it as-is;
+          #   2. a throwaway venv in $RUNNER_TEMP (the pattern the
+          #      plugin step above already proves on this runner —
+          #      its venv pip installed scons in runs 24/27; a venv's
+          #      pip is not externally managed);
+          #   3. last resort: pip --user --break-system-packages.
+          FLATTEN_PYTHON=""
+          if python3 -c "import PIL" 2>/dev/null; then
+            echo "Pillow already importable by system python3 — no install needed."
+            FLATTEN_PYTHON="python3"
+          elif python3 -m venv "$RUNNER_TEMP/flatten-venv" \
+               && "$RUNNER_TEMP/flatten-venv/bin/pip" install -q pillow \
+               && "$RUNNER_TEMP/flatten-venv/bin/python" -c "import PIL" 2>/dev/null; then
+            echo "Pillow installed into the throwaway venv."
+            FLATTEN_PYTHON="$RUNNER_TEMP/flatten-venv/bin/python"
+          elif python3 -m pip install --user -q --break-system-packages pillow \
+               && python3 -c "import PIL" 2>/dev/null; then
+            echo "Pillow installed via pip --user --break-system-packages (last resort)."
+            FLATTEN_PYTHON="python3"
+          fi
+          if [ -z "$FLATTEN_PYTHON" ]; then
+            echo "ERROR: Pillow (PIL) is not importable after the system check, the venv install, and the --break-system-packages fallback — cannot flatten icons." >&2
+            exit 1
+          fi
+          echo "Flattening icons with: $FLATTEN_PYTHON"
+          "$FLATTEN_PYTHON" -c "import PIL; print('Pillow import OK, version', getattr(PIL, '__version__', 'unknown'))"
+          "$FLATTEN_PYTHON" scripts/flatten_icons.py build/ios/thelostcoin/Images.xcassets/AppIcon.appiconset
+
+      - name: Install the App Store Connect API key
+        env:
+          KEY_P8_BASE64: ${{ secrets.ASC_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          echo "$KEY_P8_BASE64" | base64 --decode > "$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
+          echo "KEY_PATH=$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8" >> "$GITHUB_ENV"
+
+      - name: Archive (automatic signing via API key)
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project build/ios/thelostcoin.xcodeproj \
+            -scheme thelostcoin \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/build/TheLostCoin.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "$ISSUER_ID" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Automatic
+
+      - name: Write export options
+        run: |
+          set -euo pipefail
+          cat > build/ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>teamID</key>
+            <string>${TEAM_ID}</string>
+            <key>signingStyle</key>
+            <string>automatic</string>
+            <key>manageAppVersionAndBuildNumber</key>
+            <false/>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>com.eventideapps.lostcoin</key>
+              <string></string>
+            </dict>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Export the IPA
+        run: |
+          set -euo pipefail
+          xcodebuild -exportArchive \
+            -archivePath "$PWD/build/TheLostCoin.xcarchive" \
+            -exportPath "$PWD/build/ipa" \
+            -exportOptionsPlist build/ExportOptions.plist \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "$ISSUER_ID"
+          ls -la build/ipa
+
+      - name: Upload to App Store Connect (TestFlight)
+        run: |
+          set -euo pipefail
+          IPA_PATH="$(ls build/ipa/*.ipa | head -1)"
+          echo "Uploading $IPA_PATH (version 0.1.0, build $BUILD_NUMBER)"
+          xcrun altool --upload-app \
+            -f "$IPA_PATH" \
+            --apiKey "$KEY_ID" \
+            --apiIssuer "$ISSUER_ID"
+
+      - name: Keep the IPA as a run artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thelostcoin-ipa
+          path: build/ipa/*.ipa
+          if-no-files-found: ignore
