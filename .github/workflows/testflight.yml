@@ -33,7 +33,16 @@ on:
 jobs:
   testflight:
     name: Build and upload to TestFlight
-    runs-on: macos-15
+    # macos-26 (NOT macos-15): run 41 (2026-11-20, TESTFLIGHT_NOTES
+    # §9) proved the macos-15 image's iPhoneOS 18.5 SDK (Xcode 16.4)
+    # cannot link Godot 4.7.2's metal_cpp template — the iOS 26-era
+    # symbols _CADynamicRange* / _MTLTensorDomain are absent there.
+    # The macos-26 arm64 image's default Xcode is a 26.x carrying an
+    # iOS 26 SDK (runner-images readme, image 20261117: Xcode 26.6
+    # default, iphoneos26.5 SDK), and the image policy keeps exactly
+    # one Xcode major per macOS major, so the default cannot drift
+    # off 26.x — no explicit xcode-select step is needed.
+    runs-on: macos-26
     # 120 (not 60): a cache-miss run additionally builds the Godot headers
     # for the InAppStore plugin from source, which is the long pole.
     timeout-minutes: 120
@@ -81,8 +90,12 @@ jobs:
           # Bump the -vN suffix if the build recipe below changes.
           # (v4: pre-flight audit fixes to the verification tail and the
           # export step — see files/PREFLIGHT_AUDIT.md. Run 7 proved the
-          # v3 cache was never saved, so this bump costs no rebuild.)
-          key: inappstore-xcframeworks-caafb2c7-godot4.7.2-v4
+          # v3 cache was never saved, so this bump costs no rebuild.
+          # v5: the job moved from the macos-15 image to macos-26 —
+          # xcframeworks built under Xcode 16.4 / iPhoneOS 18.5 SDK
+          # must not be restored into the Xcode 26 toolchain, so the
+          # first macos-26 run rebuilds the plugin and re-saves.)
+          key: inappstore-xcframeworks-caafb2c7-godot4.7.2-v5
 
       - name: Build the InAppStore plugin from pinned source
         if: steps.plugin-cache.outputs.cache-hit != 'true'
@@ -118,7 +131,7 @@ jobs:
           # Cap the header/engine scons at -j2: the runner auto-detects
           # 3 cores, and 3 parallel clang jobs over the engine's
           # largest translation units are the peak-memory risk on the
-          # standard macos-15 runner. -j2 trades wall-clock for a
+          # standard macOS arm64 runner. -j2 trades wall-clock for a
           # roughly one-third lower peak; the headers produced (the
           # only output this step exists for) are identical.
           sed -i '' 's|scons platform=ios target=template_debug|scons platform=ios target=template_debug -j2|' "$PLUGINS_DIR/scripts/generate_headers.sh"
@@ -411,10 +424,23 @@ jobs:
           set -euo pipefail
           IPA_PATH="$(ls build/ipa/*.ipa | head -1)"
           echo "Uploading $IPA_PATH (version 0.1.0, build $BUILD_NUMBER)"
+          # altool still ships in Xcode 26 (verified 2026-11-20,
+          # TESTFLIGHT_NOTES §9) and --upload-app still works with
+          # API-key auth, but it is deprecated there, and Xcode 26's
+          # altool is documented (Bitrise's deploy step changelog;
+          # multiple CI field reports) to NOT reliably return a
+          # non-zero exit code when an upload fails — trusting $?
+          # alone could report a green run with nothing uploaded.
+          # Capture the output and fail LOUDLY on Apple's error
+          # markers; pipefail still propagates a real non-zero exit.
           xcrun altool --upload-app \
             -f "$IPA_PATH" \
             --apiKey "$KEY_ID" \
-            --apiIssuer "$ISSUER_ID"
+            --apiIssuer "$ISSUER_ID" 2>&1 | tee "$RUNNER_TEMP/altool-upload.log"
+          if grep -Eq "ERROR ITMS-|error:" "$RUNNER_TEMP/altool-upload.log"; then
+            echo "ERROR: altool reported an upload error (see its output above) — treating the upload as failed even if altool exited 0." >&2
+            exit 1
+          fi
 
       - name: Keep the IPA as a run artifact
         if: always()
